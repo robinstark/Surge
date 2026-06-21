@@ -1,17 +1,23 @@
-import { createSignal } from 'solid-js';
+import { createSignal, For, Show } from 'solid-js';
 import { STORAGE_KEYS } from '../../../lib/storage';
 import {
-  serverUrl, setServerUrl,
-  serverUrlLocked, setServerUrlLocked,
+  setServerUrl,
+  setServerUrlLocked,
   serverConnected,
-  authToken, setAuthToken,
-  authTokenLocked, setAuthTokenLocked,
+  serverProfiles, setServerProfiles,
+  activeProfileId, setActiveProfileId,
+  setAuthToken,
+  setAuthTokenLocked,
   authValid, setAuthValid,
   interceptEnabled, setInterceptEnabled,
   notificationsEnabled, setNotificationsEnabled,
   minFileSize, setMinFileSize,
 } from '../store';
-import { normalizeToken, normalizeServerUrl } from '../lib/utils';
+import {
+  handleAddProfile as _handleAddProfile,
+  handleSwitchProfile as _handleSwitchProfile,
+  handleDeleteProfile as _handleDeleteProfile,
+} from '../lib/settings-handlers';
 
 function saveStatusSignal() {
   const [status, setStatus] = createSignal('');
@@ -26,77 +32,84 @@ function saveStatusSignal() {
 
 export default function SettingsView() {
   const [serverStatus, showServerStatus] = saveStatusSignal();
-  const [tokenStatus, showTokenStatus] = saveStatusSignal();
-  const [tokenFocused, setTokenFocused] = createSignal(false);
+  const [newProfileName, setNewProfileName] = createSignal('');
+  const [newProfileUrl, setNewProfileUrl] = createSignal('');
+  const [newProfileToken, setNewProfileToken] = createSignal('');
+  const [isConnecting, setIsConnecting] = createSignal(false);
+  const [connectionValid, setConnectionValid] = createSignal(false);
+
   const extensionVersion = browser.runtime.getManifest().version;
   const isFirefox = (browser.runtime.getURL as (path?: string) => string)('').startsWith('moz-extension:');
 
-  const handleServerSave = async () => {
-    const url = normalizeServerUrl(serverUrl());
-    setServerUrl(url);
-    showServerStatus('Saving...');
-    try {
-      await browser.storage.local.set({ [STORAGE_KEYS.SERVER_URL]: url });
-      setServerUrlLocked(url.length > 0);
-      showServerStatus('Saved');
-    } catch {
-      showServerStatus('Failed to save');
-    }
-  };
+  const makeStore = () => ({
+    getProfiles: serverProfiles,
+    getActiveId: activeProfileId,
+    setProfiles: setServerProfiles,
+    setActiveId: setActiveProfileId,
+    setServerUrl,
+    setServerUrlLocked,
+    setAuthToken,
+    setAuthTokenLocked,
+    setAuthValid,
+  });
 
-  const handleServerDelete = async () => {
-    setServerUrl('');
-    setServerUrlLocked(false);
-    showServerStatus('Removing...');
-    try {
-      await browser.storage.local.set({ [STORAGE_KEYS.SERVER_URL]: '' });
-      showServerStatus('Removed');
-    } catch {
-      setServerUrlLocked(true);
-      showServerStatus('Failed to remove');
+  const handleConnect = async () => {
+    const url = newProfileUrl().trim();
+    const token = newProfileToken().trim();
+    if (!token) {
+      showServerStatus('Enter an Auth Token');
+      return;
     }
-  };
 
-  const handleSaveToken = async () => {
-    const token = normalizeToken(authToken());
-    setAuthToken(token);
-    showTokenStatus('Saving...');
+    setIsConnecting(true);
+    showServerStatus('Connecting...', 0); // Keep showing until done
+    
     try {
-      await browser.storage.local.set({
-        [STORAGE_KEYS.TOKEN]: token,
-        [STORAGE_KEYS.VERIFIED]: 'false',
-      });
-      setAuthTokenLocked(token.length > 0);
-      showTokenStatus('Saved');
-      const res = await browser.runtime.sendMessage({ type: 'validateAuth', token }).catch(() => null) as { ok?: boolean; error?: string } | null;
-      setAuthValid(res?.ok ?? false);
+      const res = await browser.runtime.sendMessage({ type: 'testConnection', url, token }).catch(() => null) as { ok?: boolean; url?: string; error?: string } | null;
       if (res?.ok) {
-        await browser.storage.local.set({ [STORAGE_KEYS.VERIFIED]: 'true' });
-      } else if (res?.error === 'no_server') {
-        showTokenStatus('Server unavailable');
+        setConnectionValid(true);
+        showServerStatus('Connected');
       } else if (res?.error === 'invalid_token') {
-        showTokenStatus('Invalid Token');
+        showServerStatus('Invalid Token');
+      } else {
+        showServerStatus('Server unavailable');
       }
     } catch {
-      showTokenStatus('Failed to save');
+      showServerStatus('Server unavailable');
+    } finally {
+      setIsConnecting(false);
     }
   };
 
-  const handleDeleteToken = async () => {
-    setAuthToken('');
-    setAuthTokenLocked(false);
-    setAuthValid(false);
-    showTokenStatus('Removing...');
-    try {
-      await browser.storage.local.set({
-        [STORAGE_KEYS.TOKEN]: '',
-        [STORAGE_KEYS.VERIFIED]: 'false',
-      });
-      showTokenStatus('Removed');
-    } catch {
-      setAuthTokenLocked(true);
-      showTokenStatus('Failed to remove');
+  const handleSaveProfile = async () => {
+    showServerStatus('Saving...', 0);
+    const result = await _handleAddProfile(
+      { name: newProfileName(), url: newProfileUrl(), token: newProfileToken() },
+      makeStore(),
+      browser.storage.local,
+      true, // Set authValid = true because we just successfully connected!
+    );
+    if (result.ok) {
+      setNewProfileName('');
+      setNewProfileUrl('');
+      setNewProfileToken('');
+      setConnectionValid(false);
+      showServerStatus('Saved');
+    } else {
+      showServerStatus(result.error ?? 'Failed to save');
     }
+  };
+
+  const handleSwitchProfile = async (profileId: string) => {
+    showServerStatus('Switching...', 0);
+    const result = await _handleSwitchProfile(profileId, makeStore(), browser.storage.local);
+    showServerStatus(result.ok ? 'Switched' : (result.error ?? 'Failed to switch'));
+  };
+
+  const handleDeleteProfile = async () => {
+    showServerStatus('Removing...', 0);
+    const result = await _handleDeleteProfile(makeStore(), browser.storage.local);
+    showServerStatus(result.ok ? 'Removed' : (result.error ?? 'Failed to remove'));
   };
 
   const handleInterceptToggle = async (checked: boolean) => {
@@ -163,61 +176,86 @@ export default function SettingsView() {
 
       <div class="settings-group">
         <h3 class="settings-group-title">Server</h3>
-        <div class="settings-field">
-          <label class="settings-label" for="server-url">Server URL</label>
-          <div class="auth-input settings-input-row">
-            <input
-              id="server-url"
-              type="text"
-              value={serverUrl()}
-              placeholder="http://127.0.0.1:1700"
-              disabled={serverUrlLocked()}
-              onInput={(e) => { setServerUrl((e.target as HTMLInputElement).value); }}
-            />
-            <button onClick={() => { void (serverUrlLocked() ? handleServerDelete() : handleServerSave()); }}>
-              {serverUrlLocked() ? 'Delete' : 'Save'}
-            </button>
-          </div>
-          {serverStatus() && (
-            <div class={`auth-status below${serverStatus() === 'Saved' || serverStatus() === 'Removed' ? ' ok' : serverStatus().endsWith('...') ? '' : ' err'}`}>{serverStatus()}</div>
-          )}
-        </div>
 
-        <div class="settings-field">
-          <label class="settings-label" for="auth-token">Auth Token</label>
+        <Show when={serverProfiles().length > 0}>
+          <div class="settings-field">
+            <label class="settings-label" for="server-profile">Active Server</label>
+            <div class="auth-input settings-input-row">
+              <select
+                id="server-profile"
+                value={activeProfileId()}
+                onChange={(e) => { void handleSwitchProfile((e.target as HTMLSelectElement).value); }}
+              >
+                <For each={serverProfiles()}>
+                  {(profile) => (
+                    <option value={profile.id}>{profile.name} ({profile.url || 'localhost'})</option>
+                  )}
+                </For>
+              </select>
+              <button onClick={() => { void handleDeleteProfile(); }}>Delete</button>
+            </div>
+            <div class="settings-help" style="margin-top: 10px; display: flex; align-items: center; gap: 6px;">
+              <strong>Status:</strong> {
+                !serverConnected() ? <span class="auth-status err" style="margin: 0;">Disconnected</span> :
+                !authValid() ? <span class="auth-status err" style="margin: 0;">Invalid Token</span> :
+                <span class="auth-status ok" style="margin: 0;">Connected</span>
+              }
+            </div>
+          </div>
+        </Show>
+
+        <div class="settings-field" style={serverProfiles().length > 0 ? "margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border-subtle);" : ""}>
+          <label class="settings-label">
+            {serverProfiles().length > 0 ? 'Add a Server' : 'Connect to a Server'}
+          </label>
+          
+          <div class="auth-input settings-input-row" style="margin-bottom: 8px;">
+            <input
+              id="profile-url"
+              type="text"
+              value={newProfileUrl()}
+              placeholder="Server URL (e.g. http://127.0.0.1:1700)"
+              onInput={(e) => { setNewProfileUrl((e.target as HTMLInputElement).value); setConnectionValid(false); }}
+              disabled={isConnecting()}
+            />
+          </div>
+          
           <div class="auth-input settings-input-row">
             <input
-              id="auth-token"
+              id="profile-token"
               type="password"
-              value={authToken()}
-              placeholder="Enter your token"
-              disabled={authTokenLocked()}
-              onInput={(e) => {
-                setAuthToken((e.target as HTMLInputElement).value);
-                showTokenStatus('');
-              }}
-              onFocus={() => setTokenFocused(true)}
-              onBlur={() => setTokenFocused(false)}
+              value={newProfileToken()}
+              placeholder="Auth Token"
+              onInput={(e) => { setNewProfileToken((e.target as HTMLInputElement).value); setConnectionValid(false); }}
+              disabled={isConnecting()}
             />
-            <button onClick={() => { void (authTokenLocked() ? handleDeleteToken() : handleSaveToken()); }}>
-              {authTokenLocked() ? 'Delete' : 'Save'}
+            <button onClick={() => { void handleConnect(); }} disabled={isConnecting() || !newProfileToken()}>
+              {isConnecting() ? '...' : 'Connect'}
             </button>
           </div>
-          <div class="settings-help">
-            Token can be obtained from <strong>TUI &gt; Settings &gt; Extension</strong>
-          </div>
-          {tokenStatus() && !tokenFocused() && (
-            <div class={`auth-status below${tokenStatus() === 'Saved' || tokenStatus() === 'Removed' ? ' ok' : tokenStatus().endsWith('...') ? '' : ' err'}`}>{tokenStatus()}</div>
+          
+          {serverStatus() && !connectionValid() && (
+            <div class={`auth-status below${serverStatus() === 'Connected' || serverStatus() === 'Saved' || serverStatus() === 'Removed' || serverStatus() === 'Switched' ? ' ok' : serverStatus().endsWith('...') ? '' : ' err'}`}>{serverStatus()}</div>
           )}
-          {authTokenLocked() && !authValid() && serverConnected() && !tokenFocused() && !tokenStatus() && (
-            <div class="auth-status below err">Invalid Token</div>
-          )}
-          {authTokenLocked() && !authValid() && !serverConnected() && !tokenFocused() && !tokenStatus() && (
-            <div class="auth-status below err">Server unavailable</div>
-          )}
-          {!authToken() && !tokenFocused() && !tokenStatus() && (
-            <div class="auth-status below err">Token is Required</div>
-          )}
+
+          <Show when={connectionValid()}>
+            <div style="margin-top: 16px; padding: 14px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-default);">
+              <label class="settings-label" for="profile-name" style="margin-bottom: 10px;">Save Profile</label>
+              <div class="auth-input settings-input-row">
+                <input
+                  id="profile-name"
+                  type="text"
+                  value={newProfileName()}
+                  placeholder="Name (e.g. Home PC)"
+                  onInput={(e) => { setNewProfileName((e.target as HTMLInputElement).value); }}
+                />
+                <button onClick={() => { void handleSaveProfile(); }}>Save</button>
+              </div>
+              {serverStatus() && (
+                 <div class={`auth-status below${serverStatus() === 'Saved' ? ' ok' : serverStatus().endsWith('...') ? '' : ' err'}`}>{serverStatus()}</div>
+              )}
+            </div>
+          </Show>
         </div>
       </div>
 

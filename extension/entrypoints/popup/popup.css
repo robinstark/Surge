@@ -43,6 +43,7 @@ html, body, #app {
   width: 360px;
   height: 540px;
   overflow: hidden;
+  color-scheme: dark;
 }
 
 body {
@@ -856,7 +857,8 @@ body {
   gap: 6px;
 }
 
-.auth-input input {
+.auth-input input,
+.auth-input select {
   flex: 1;
   min-width: 0;
   height: 28px;
@@ -866,6 +868,16 @@ body {
   background: var(--bg-elevated);
   color: var(--text-primary);
   font-size: 12px;
+}
+
+.auth-input select {
+  cursor: pointer;
+  outline: none;
+}
+
+.auth-input select:focus,
+.auth-input input:focus {
+  border-color: var(--accent-primary);
 }
 
 .auth-input button {

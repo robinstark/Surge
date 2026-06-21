@@ -1,7 +1,13 @@
 import { defineBackground } from 'wxt/utils/define-background';
 import { normalizeToken, normalizeServerUrl } from './popup/lib/utils';
 import { DownloadStatus, HistoryEntry } from './popup/store/types';
-import { STORAGE_KEYS, readStoredNumber } from '../lib/storage';
+import {
+  STORAGE_KEYS,
+  readStoredNumber,
+  parseServerProfiles,
+  migrateServerProfiles,
+  resolveActiveServerUrl,
+} from '../lib/storage';
 import {
   buildDownloadRequestBody,
   buildEventStreamHeaders,
@@ -67,6 +73,11 @@ async function storageGet(key: string): Promise<string | undefined> {
   return typeof result[key] === 'string' ? result[key] : undefined;
 }
 
+async function storageGetRaw(key: string): Promise<unknown> {
+  const result = await browser.storage.local.get(key);
+  return result[key];
+}
+
 async function storageGetBoolean(key: string): Promise<boolean | undefined> {
   const result = await browser.storage.local.get(key);
   return coerceStoredBoolean(result[key]);
@@ -93,21 +104,48 @@ function setCachedDiscoveredServerUrlState(url: string | null): void {
 }
 
 async function loadPersistedState(): Promise<void> {
-  const [token, serverUrl, discoveredServerUrl] = await Promise.all([
+  const [token, serverUrl, discoveredServerUrl, profiles, activeProfileId] = await Promise.all([
     storageGet(STORAGE_KEYS.TOKEN),
     storageGet(STORAGE_KEYS.SERVER_URL),
     storageGet(STORAGE_KEYS.DISCOVERED_SERVER_URL),
+    storageGetRaw(STORAGE_KEYS.PROFILES),
+    storageGet(STORAGE_KEYS.ACTIVE_PROFILE_ID),
   ]);
+
+  // Resolve the active server URL from the profile list, transparently treating a
+  // legacy single SERVER_URL as a default profile. The popup persists the migrated
+  // profile list; the background only reads to stay a passive consumer of storage.
+  const migration = migrateServerProfiles({
+    [STORAGE_KEYS.SERVER_URL]: serverUrl,
+    [STORAGE_KEYS.PROFILES]: profiles,
+    [STORAGE_KEYS.ACTIVE_PROFILE_ID]: activeProfileId,
+  });
+  const activeServerUrl = resolveActiveServerUrl(migration.profiles, migration.activeId);
 
   if (!hasHydratedAuthToken) {
     setCachedAuthTokenState(token || null);
   }
   if (!hasHydratedServerUrl) {
-    setCachedServerUrlState(serverUrl || null);
+    setCachedServerUrlState(activeServerUrl || null);
   }
   if (!hasHydratedDiscoveredServerUrl) {
     setCachedDiscoveredServerUrlState(discoveredServerUrl || null);
   }
+}
+
+async function reresolveActiveServerUrl(): Promise<void> {
+  const [profiles, activeProfileId] = await Promise.all([
+    storageGetRaw(STORAGE_KEYS.PROFILES),
+    storageGet(STORAGE_KEYS.ACTIVE_PROFILE_ID),
+  ]);
+  // Use parseServerProfiles (not migrateServerProfiles) — migration is a startup
+  // concern handled once in loadPersistedState. The change listener only needs to
+  // read the already-persisted profile list and resolve the active URL.
+  const parsed = parseServerProfiles({ [STORAGE_KEYS.PROFILES]: profiles });
+  const activeServerUrl = resolveActiveServerUrl(parsed, activeProfileId ?? '');
+  setCachedServerUrlState(normalizeServerUrl(activeServerUrl) || null);
+  lastHealthCheck = 0;
+  lastBaseUrlFailureAt = 0;
 }
 
 function ensurePersistedStateLoaded(): Promise<void> {
@@ -167,17 +205,20 @@ async function persistDiscoveredServerUrl(url: string | null): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function discoverBaseUrl(): Promise<string | null> {
-  // Try the user-configured URL first and only.
+  let baseHost = '127.0.0.1';
   if (cachedServerUrl) {
     const ok = await healthCheck(cachedServerUrl);
     if (ok) return cachedServerUrl;
-    return null;
+    try {
+      baseHost = new URL(cachedServerUrl).hostname || '127.0.0.1';
+    } catch { /* ignore */ }
   }
 
   const candidates = buildPortScanCandidates(
     DEFAULT_PORT,
     MAX_PORT_SCAN,
-    [cachedDiscoveredServerUrl],
+    [cachedServerUrl, cachedDiscoveredServerUrl],
+    baseHost
   );
 
   const token = cachedAuthToken;
@@ -189,20 +230,23 @@ async function discoverBaseUrl(): Promise<string | null> {
 }
 
 async function discoverBaseUrlForToken(token: string): Promise<{ base: string | null; sawUnauthorized: boolean; sawReachable: boolean }> {
+  let baseHost = '127.0.0.1';
   if (cachedServerUrl) {
-    if (!await healthCheck(cachedServerUrl)) return { base: null, sawUnauthorized: false, sawReachable: false };
-    const auth = await checkAuthAtBaseUrl(cachedServerUrl, token);
-    return {
-      base: auth.ok ? cachedServerUrl : null,
-      sawUnauthorized: auth.status === 401,
-      sawReachable: true,
-    };
+    if (await healthCheck(cachedServerUrl)) {
+      const auth = await checkAuthAtBaseUrl(cachedServerUrl, token);
+      if (auth.ok) return { base: cachedServerUrl, sawUnauthorized: false, sawReachable: true };
+      if (auth.status === 401) return { base: null, sawUnauthorized: true, sawReachable: true };
+    }
+    try {
+      baseHost = new URL(cachedServerUrl).hostname || '127.0.0.1';
+    } catch { /* ignore */ }
   }
 
   const candidates = buildPortScanCandidates(
     DEFAULT_PORT,
     MAX_PORT_SCAN,
-    [cachedDiscoveredServerUrl],
+    [cachedServerUrl, cachedDiscoveredServerUrl],
+    baseHost
   );
 
   let sawUnauthorized = false;
@@ -632,6 +676,43 @@ function handleMessage(message: Record<string, any>): Promise<unknown> | unknown
     // Health / connection
     case 'checkHealth': return checkHealthSilent().then(healthy => ({ healthy }));
 
+    case 'testConnection':
+      return (async () => {
+        const url = normalizeServerUrl(message.url || '');
+        const token = normalizeToken(message.token || '');
+        if (!token) return { ok: false, error: 'invalid_input' };
+        
+        let baseHost = '127.0.0.1';
+        if (url) {
+          try {
+            baseHost = new URL(url).hostname || '127.0.0.1';
+          } catch { /* ignore */ }
+        }
+
+        const candidates = buildPortScanCandidates(DEFAULT_PORT, MAX_PORT_SCAN, [url], baseHost);
+        let sawUnauthorized = false;
+        for (let index = 0; index < candidates.length; index += PORT_SCAN_BATCH_SIZE) {
+          const batch = candidates.slice(index, index + PORT_SCAN_BATCH_SIZE);
+          const results = await Promise.all(batch.map(async (candidate) => {
+            try {
+              const r1 = await fetch(`${candidate}/health`, { signal: AbortSignal.timeout(300) });
+              if (!r1.ok) return { candidate, ok: false, status: 0 };
+              const r2 = await fetch(`${candidate}/list`, {
+                headers: { Authorization: `Bearer ${token}` },
+                signal: AbortSignal.timeout(1000),
+              });
+              return { candidate, ok: r2.ok, status: r2.status };
+            } catch { return { candidate, ok: false, status: 0 }; }
+          }));
+
+          for (const result of results) {
+            if (result.status === 401) sawUnauthorized = true;
+            if (result.ok) return { ok: true, url: result.candidate };
+          }
+        }
+        return { ok: false, error: sawUnauthorized ? 'invalid_token' : 'no_server' };
+      })();
+
     case 'validateAuth':
       return (async () => {
         const token = normalizeToken(message.token || '');
@@ -812,7 +893,10 @@ export default defineBackground(() => {
   // Storage change propagation
   browser.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== 'local') return;
-    if (changes[STORAGE_KEYS.SERVER_URL]?.newValue !== undefined) {
+    // Re-resolve the active server URL when the profile list or selection changes.
+    if (changes[STORAGE_KEYS.PROFILES] || changes[STORAGE_KEYS.ACTIVE_PROFILE_ID]) {
+      void reresolveActiveServerUrl();
+    } else if (changes[STORAGE_KEYS.SERVER_URL]?.newValue !== undefined) {
       setCachedServerUrlState(normalizeServerUrl(changes[STORAGE_KEYS.SERVER_URL].newValue as string) || null);
       lastHealthCheck = 0;
       lastBaseUrlFailureAt = 0;
@@ -913,4 +997,5 @@ export const __test__ = {
     processedIds.clear();
   },
   handleDownloadCreated,
+  reresolveActiveServerUrl,
 };
