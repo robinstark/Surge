@@ -247,6 +247,7 @@ func (ps *ProgressState) SessionReset() {
 	ps.SessionStartBytes = 0
 	ps.StartTime = time.Now()
 	ps.SavedElapsed = 0
+	ps.ActiveWorkers.Store(0)
 	ps.Done.Store(false)
 	ps.Paused.Store(false)
 	ps.Pausing.Store(false)
@@ -435,7 +436,6 @@ func (ps *ProgressState) UpdateChunkStatus(offset, length int64, status ChunkSta
 	ps.mu.Lock()
 
 	if ps.ActualChunkSize == 0 || len(ps.ChunkBitmap) == 0 {
-		utils.Debug("UpdateChunkStatus skipped: ActualChunkSize=%d, BitmapLen=%d", ps.ActualChunkSize, len(ps.ChunkBitmap))
 		ps.mu.Unlock()
 		return
 	}

@@ -82,38 +82,83 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 	if d.State != nil {
 		d.State.SetURL(rawurl)
 		d.State.SetDestPath(destPath)
+		d.State.ActiveWorkers.Store(1)
+		defer d.State.ActiveWorkers.Store(0)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
-	if err != nil {
-		return err
+	dlCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if d.State != nil {
+		d.State.SetCancelFunc(cancel)
 	}
 
-	for key, val := range d.Headers {
-		// Never forward a caller-supplied Range header. This downloader fetches
-		// the whole file in one connection, so a range-capable server would
-		// reply 206 and the strict 200 check below would abort a valid download.
-		// The worker, probe and redirect paths strip Range for the same reason.
-		if strings.EqualFold(key, "Range") {
+	buildRequest := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(dlCtx, http.MethodGet, rawurl, nil)
+		if err != nil {
+			return nil, err
+		}
+		for key, val := range d.Headers {
+			if strings.EqualFold(key, "Range") {
+				continue
+			}
+			req.Header.Set(key, val)
+		}
+		req.Header.Set("User-Agent", d.Runtime.GetUserAgent())
+		return req, nil
+	}
+
+	var resp *http.Response
+	const maxRlRetries = types.RateLimitMaxRetries
+	rlRetries := 0
+
+	for {
+		req, err := buildRequest()
+		if err != nil {
+			return err
+		}
+
+		resp, err = client.Do(req)
+		if err != nil {
+			utils.Debug("Single downloader: GET %s failed: %v", rawurl, err)
+			return err
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			(resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "") {
+			_ = resp.Body.Close()
+			rlRetries++
+			if rlRetries > maxRlRetries {
+				utils.Debug("Single downloader: rate limited after %d retries for %s", maxRlRetries, rawurl)
+				return fmt.Errorf("rate limited after %d retries: %d", maxRlRetries, resp.StatusCode)
+			}
+
+			ra, _ := engine.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+			if ra <= 0 {
+				ra = 5 * time.Second
+			}
+			utils.Debug("Single downloader: rate limited (%d), waiting %v (retry %d/%d)", resp.StatusCode, ra, rlRetries, maxRlRetries)
+			select {
+			case <-dlCtx.Done():
+				return dlCtx.Err()
+			case <-time.After(ra):
+			}
 			continue
 		}
-		req.Header.Set(key, val)
-	}
-	req.Header.Set("User-Agent", d.Runtime.GetUserAgent())
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			utils.Debug("Error closing response body: %v", err)
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		utils.Debug("Single downloader: unexpected status %d for %s", resp.StatusCode, rawurl)
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
+
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			utils.Debug("Error closing response body: %v", cerr)
+		}
+	}()
 
 	if fileSize <= 0 && resp.ContentLength > 0 {
 		fileSize = resp.ContentLength
@@ -166,6 +211,7 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
+		utils.Debug("Single downloader: copy error for %s: %v", rawurl, err)
 		return fmt.Errorf("copy error: %w", err)
 	}
 
@@ -226,6 +272,7 @@ type progressReader struct {
 	batchInterval time.Duration
 	written       int64
 	pending       int64
+	pendingStart  int64
 	lastFlush     time.Time
 	readChecks    uint8
 }
@@ -251,6 +298,9 @@ func (w *progressReader) Read(p []byte) (int, error) {
 
 	written := int64(n)
 	w.written += written
+	if w.pending == 0 {
+		w.pendingStart = w.written - written
+	}
 	w.pending += written
 	if w.pending >= w.batchSize {
 		w.flushWithTime(time.Now())
@@ -288,6 +338,9 @@ func (w *progressReader) flushWithTime(now time.Time) {
 		return
 	}
 
+	if w.pending > 0 {
+		w.state.UpdateChunkStatus(w.pendingStart, w.pending, types.ChunkCompleted)
+	}
 	w.state.Downloaded.Store(w.written)
 	w.state.VerifiedProgress.Store(w.written)
 	w.pending = 0
