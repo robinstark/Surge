@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"github.com/SurgeDM/Surge/internal/orchestrator"
+	engineprogress "github.com/SurgeDM/Surge/internal/progress"
+
 	"context"
 	"fmt"
 	"os"
@@ -20,12 +23,10 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/core"
-	"github.com/SurgeDM/Surge/internal/engine/events"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
+	"github.com/SurgeDM/Surge/internal/service"
 	"github.com/SurgeDM/Surge/internal/tui/colors"
 	"github.com/SurgeDM/Surge/internal/tui/components"
+	"github.com/SurgeDM/Surge/internal/types"
 	"github.com/SurgeDM/Surge/internal/version"
 )
 
@@ -104,11 +105,11 @@ type DownloadModel struct {
 
 	// Unified architecture: View Model updated by events
 	// No direct state access or polling reporter
-	state *types.ProgressState // Keep for now if needed for details view, but mostly passive
+	state *engineprogress.DownloadProgress // Keep for now if needed for details view, but mostly passive
 
-	done     bool
-	started  bool // Engine has confirmed start
-	err      error
+	done        bool
+	started     bool // Engine has confirmed start
+	err         error
 	paused      bool
 	pausing     bool // UI state: transitioning to pause
 	resuming    bool // UI state: waiting for async resume
@@ -127,8 +128,8 @@ type RootModel struct {
 	purgeTargetID string
 	// Service Interface
 	// Core
-	Service      core.DownloadService
-	Orchestrator *processing.LifecycleManager
+	Service      service.DownloadService
+	Orchestrator *orchestrator.LifecycleManager
 
 	// File picker for directory selection
 	filepicker             filepicker.Model
@@ -191,9 +192,9 @@ type RootModel struct {
 
 	// Batch import
 	pendingBatchURLs         []string // URLs pending batch import
-	pendingBatchRequests     []events.DownloadRequestMsg
-	pendingRequestQueue      []events.DownloadRequestMsg
-	pendingBatchRequestQueue []events.BatchDownloadRequestMsg
+	pendingBatchRequests     []types.DownloadEvent
+	pendingRequestQueue      []types.DownloadEvent
+	pendingBatchRequestQueue []types.DownloadEvent
 	batchFilePath            string // Path to the batch file
 
 	// URL Refresh
@@ -246,7 +247,7 @@ type RootModel struct {
 // NewDownloadModel creates a new download model
 func NewDownloadModel(id string, url string, filename string, total int64) *DownloadModel {
 	// Create dummy state container for compatibility if needed
-	state := types.NewProgressState(id, total)
+	state := engineprogress.New(id, total)
 	return &DownloadModel{
 		ID:            id,
 		URL:           url,
@@ -263,7 +264,7 @@ func NewDownloadModel(id string, url string, filename string, total int64) *Down
 	}
 }
 
-func InitialRootModel(serverPort int, currentVersion string, service core.DownloadService, orchestrator *processing.LifecycleManager, noResume bool, currentCommit ...string) RootModel {
+func InitialRootModel(serverPort int, currentVersion string, service service.DownloadService, orchestrator *orchestrator.LifecycleManager, settings *config.Settings, noResume bool, currentCommit ...string) RootModel {
 	initialDarkBackground := true
 	if !IsTestMode {
 		initialDarkBackground = lipgloss.HasDarkBackground(os.Stdin, os.Stdout)
@@ -275,7 +276,10 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 		}
 	}
 
-	// Initialize inputs
+	if settings == nil {
+		settings = config.DefaultSettings()
+	}
+
 	urlInput := textinput.New()
 	urlInput.Placeholder = "https://example.com/file.zip"
 	urlInput.Focus()
@@ -300,7 +304,6 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 
 	pwd, _ := os.Getwd()
 
-	// Initialize file picker for directory selection - default to Downloads folder
 	homeDir, _ := os.UserHomeDir()
 	downloadsDir := filepath.Join(homeDir, "Downloads")
 	fp := filepicker.New()
@@ -312,15 +315,6 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 	fp.ShowPermissions = true
 	fp.SetHeight(FilePickerHeight)
 	applyFilepickerTheme(&fp)
-
-	// Load settings for auto resume
-	settings, errSettings := config.LoadSettings()
-	if settings == nil {
-		settings = config.DefaultSettings()
-	}
-	if errSettings != nil {
-		settings.StartupWarnings = append(settings.StartupWarnings, fmt.Sprintf("Failed to load settings: %v", errSettings))
-	}
 
 	keys, errKeys := config.LoadKeyMap()
 	if keys == nil {
@@ -355,7 +349,7 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 	// Load paused downloads from master list (now uses global config directory)
 	var downloads []*DownloadModel
 	// Note: With Service abstraction, we might want to let the Service handle loading.
-	// But LocalDownloadService's List() calls state.ListAllDownloads().
+	// But LocalDownloadService's List() calls store.ListAllDownloads().
 	// For TUI initialization, we should probably call Service.List() to populate the model.
 	// However, Service.List() returns []DownloadStatus, which we need to convert to []*DownloadModel.
 
@@ -654,7 +648,7 @@ func (m RootModel) matchesCategoryFilter(d *DownloadModel) bool {
 		}
 	}
 	if filename == "" || filename == "Queued" {
-		filename = processing.InferFilenameFromURL(d.URL)
+		filename = orchestrator.InferFilenameFromURL(d.URL)
 	}
 
 	cat, err := config.GetCategoryForFile(filename, m.Settings.Categories.Categories)

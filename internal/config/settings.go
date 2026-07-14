@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/SurgeDM/Surge/internal/types"
 	"github.com/SurgeDM/Surge/internal/utils"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -1078,9 +1078,14 @@ func ValidateDNSList(s string) error {
 	return nil
 }
 
+var jsonWriteMutex sync.Mutex
+
 // writeJSONAtomic marshals v as indented JSON and writes it to path atomically
 // using a temp-file-then-rename strategy.
 func writeJSONAtomic(path string, v any) error {
+	jsonWriteMutex.Lock()
+	defer jsonWriteMutex.Unlock()
+
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -1088,16 +1093,37 @@ func writeJSONAtomic(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	tempPath := path + ".tmp"
-	if err := os.WriteFile(tempPath, data, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), "json-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := f.Name()
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tempPath)
 		return err
 	}
 	return os.Rename(tempPath, path)
 }
 
+var settingsWriteMutex sync.Mutex
+
 // writeTOMLAtomic marshals v as TOML and writes it to path atomically
 // using a temp-file-then-rename strategy.
 func writeTOMLAtomic(path string, v any) error {
+	settingsWriteMutex.Lock()
+	defer settingsWriteMutex.Unlock()
+
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -1105,8 +1131,24 @@ func writeTOMLAtomic(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	tempPath := path + ".tmp"
-	if err := os.WriteFile(tempPath, data, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), "settings-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := f.Name()
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tempPath)
 		return err
 	}
 	return os.Rename(tempPath, path)

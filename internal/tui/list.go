@@ -37,7 +37,7 @@ func (i DownloadItem) Description() string {
 	} else if d.resuming {
 		styledStatus = lipgloss.NewStyle().Foreground(colors.StateDownloading()).Render(i.spinnerView + " Resuming...")
 	} else {
-		status := components.DetermineStatus(d.done, d.paused, d.err != nil, d.Speed, d.Downloaded)
+		status := components.DetermineStatus(d.done, d.paused, d.err != nil, d.started, d.resuming)
 		styledStatus = status.RenderWithSpinner(i.spinnerView)
 	}
 
@@ -219,7 +219,6 @@ func applyListTheme(l *list.Model) {
 
 // UpdateListItems updates the list with filtered downloads based on active tab
 func (m *RootModel) UpdateListItems() {
-
 	if m.list.Width() == 0 {
 		return
 	}

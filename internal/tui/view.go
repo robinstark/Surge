@@ -515,11 +515,9 @@ func (m RootModel) View() tea.View {
 			detailBox := renderBtopBox("", PaneTitleStyle.Render(" File Details "), detailContent, layout.LeftWidth, layout.DetailHeight, colors.Gray())
 			body = lipgloss.JoinVertical(lipgloss.Left, headerBox, listBox, detailBox)
 		} else {
-
 			body = lipgloss.JoinVertical(lipgloss.Left, headerBox, listBox)
 		}
 	} else {
-
 		leftColumn := lipgloss.JoinVertical(lipgloss.Left, headerBox, listBox)
 		body = lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, rightColumn)
 	}
@@ -805,7 +803,7 @@ func getDownloadStatus(d *DownloadModel, spinnerView string) string {
 	if d.resuming {
 		return lipgloss.NewStyle().Foreground(colors.StateDownloading()).Render(spinnerView + " Resuming...")
 	}
-	status := components.DetermineStatus(d.done, d.paused, d.err != nil, d.Speed, d.Downloaded)
+	status := components.DetermineStatus(d.done, d.paused, d.err != nil, d.started, d.resuming)
 	return status.RenderWithSpinner(spinnerView)
 }
 

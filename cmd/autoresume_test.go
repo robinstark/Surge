@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/core"
-	"github.com/SurgeDM/Surge/internal/download"
-	"github.com/SurgeDM/Surge/internal/engine/state"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
+	"github.com/SurgeDM/Surge/internal/orchestrator"
+	"github.com/SurgeDM/Surge/internal/scheduler"
+	"github.com/SurgeDM/Surge/internal/service"
+	"github.com/SurgeDM/Surge/internal/store"
+	"github.com/SurgeDM/Surge/internal/types"
 )
 
 func TestCmd_AutoResume_Execution(t *testing.T) {
@@ -22,15 +22,8 @@ func TestCmd_AutoResume_Execution(t *testing.T) {
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	originalXDG := os.Getenv("XDG_CONFIG_HOME")
-	_ = os.Setenv("XDG_CONFIG_HOME", tmpDir)
-	defer func() {
-		if originalXDG == "" {
-			_ = os.Unsetenv("XDG_CONFIG_HOME")
-		} else {
-			_ = os.Setenv("XDG_CONFIG_HOME", originalXDG)
-		}
-	}()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
 
 	surgeDir := config.GetSurgeDir()
 	if err := os.MkdirAll(surgeDir, 0o755); err != nil {
@@ -46,19 +39,19 @@ func TestCmd_AutoResume_Execution(t *testing.T) {
 	}
 
 	// 3. Configure State DB
-	state.CloseDB() // Ensure clean state
+	store.CloseDB() // Ensure clean state
 	dbPath := filepath.Join(surgeDir, "state", "surge.db")
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	state.Configure(dbPath)
+	store.Configure(dbPath)
 
 	// 4. Seed DB with a paused download
 	testID := "cmd-resume-id-1"
 	testURL := "http://example.com/cmd-resume.zip"
 	testDest := filepath.Join(tmpDir, "cmd-resume.zip")
 
-	manualState := &types.DownloadState{
+	manualState := &types.DownloadRecord{
 		ID:         testID,
 		URL:        testURL,
 		Filename:   "cmd-resume.zip",
@@ -68,7 +61,7 @@ func TestCmd_AutoResume_Execution(t *testing.T) {
 		PausedAt:   time.Now().Unix(),
 		CreatedAt:  time.Now().Unix(),
 	}
-	if err := state.AddToMasterList(types.DownloadEntry{
+	if err := store.AddToMasterList(types.DownloadRecord{
 		ID:         testID,
 		URL:        testURL,
 		DestPath:   testDest,
@@ -79,34 +72,31 @@ func TestCmd_AutoResume_Execution(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := state.SaveState(testURL, testDest, manualState); err != nil {
+	if err := store.SaveState(testURL, testDest, manualState); err != nil {
 		t.Fatal(err)
 	}
 
 	// 5. Initialize GlobalPool + GlobalService
-	GlobalProgressCh = make(chan any, 10)
-	GlobalPool = download.NewWorkerPool(GlobalProgressCh, 4)
-	GlobalService = core.NewLocalDownloadServiceWithInput(GlobalPool, GlobalProgressCh)
-
-	GlobalLifecycle = processing.NewLifecycleManager(nil, nil, nil)
-	GlobalLifecycle.SetEngineHooks(processing.EngineHooks{
-		Pause:               GlobalPool.Pause,
-		ExtractPausedConfig: GlobalPool.ExtractPausedConfig,
-		AddConfig:           GlobalPool.Add,
-		GetStatus:           GlobalPool.GetStatus,
-		Cancel:              GlobalPool.Cancel,
-		UpdateURL:           GlobalPool.UpdateURL,
-		PublishEvent:        GlobalService.Publish,
-	})
-	if svc, ok := GlobalService.(*core.LocalDownloadService); ok {
-		svc.SetLifecycleHooks(core.LifecycleHooks{
-			Pause:       GlobalLifecycle.Pause,
-			Resume:      GlobalLifecycle.Resume,
-			ResumeBatch: GlobalLifecycle.ResumeBatch,
-			Cancel:      GlobalLifecycle.Cancel,
-			UpdateURL:   GlobalLifecycle.UpdateURL,
-		})
+	GlobalProgressCh = make(chan types.DownloadEvent, 10)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
 	}
+	tmpPool := scheduler.New(GlobalProgressCh, 4)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
+
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	GlobalService = service.NewLocalDownloadService(GlobalLifecycle)
+
 	defer func() {
 		_ = GlobalService.Shutdown()
 		GlobalService = nil

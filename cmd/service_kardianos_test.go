@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -51,15 +52,25 @@ func waitStop(t *testing.T, p *program, s service.Service) {
 }
 
 func TestProgramLifecycle(t *testing.T) {
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Skipf("Skipping test because tcp listener cannot bind (e.g. Windows dual-stack provider issue): %v", err)
+	}
+	_ = ln.Close()
+
 	p := &program{}
 	s := &mockService{}
 
 	// Set args to something safe so rootCmd.ExecuteContext doesn't fail on test flags
 	rootCmd.SetArgs([]string{"--help"})
-	defer rootCmd.SetArgs(nil)
+	resetGlobalShutdownCoordinatorForTest(nil)
+	defer func() {
+		rootCmd.SetArgs(nil)
+		resetGlobalShutdownCoordinatorForTest(nil)
+	}()
 
 	// Test Start
-	err := p.Start(s)
+	err = p.Start(s)
 	assert.NoError(t, err)
 	assert.NotNil(t, p.cancel)
 	assert.NotNil(t, p.exit)
@@ -94,11 +105,21 @@ func TestToggleServiceFunc(t *testing.T) {
 }
 
 func TestProgramContextCancellation(t *testing.T) {
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Skipf("Skipping test because tcp listener cannot bind (e.g. Windows dual-stack provider issue): %v", err)
+	}
+	_ = ln.Close()
+
 	p := &program{}
 	s := &mockService{}
 
 	rootCmd.SetArgs([]string{"--help"})
-	defer rootCmd.SetArgs(nil)
+	resetGlobalShutdownCoordinatorForTest(nil)
+	defer func() {
+		rootCmd.SetArgs(nil)
+		resetGlobalShutdownCoordinatorForTest(nil)
+	}()
 
 	_ = p.Start(s)
 

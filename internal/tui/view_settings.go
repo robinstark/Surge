@@ -301,7 +301,7 @@ func (m RootModel) renderSettingsListViewport(settingsMeta []config.SettingMeta,
 		if idx == selectedRow {
 			if m.SettingsFocusedPane == 1 {
 				prefix = "\u25b8 "
-				style = lipgloss.NewStyle().Foreground(colors.Magenta()).Bold(true)
+				style = lipgloss.NewStyle().Foreground(colors.Cyan()).Bold(true)
 			} else {
 				prefix = "  "
 				style = lipgloss.NewStyle().Foreground(colors.Gray()).Bold(true)
@@ -393,7 +393,7 @@ func (m RootModel) renderSettingsDetailBlock(settingsMeta []config.SettingMeta, 
 		valueLabel = "Action: "
 	}
 
-	valueLabelStyle := lipgloss.NewStyle().Foreground(colors.Cyan()).Bold(true)
+	valueLabelStyle := lipgloss.NewStyle().Foreground(colors.LightGray()).Bold(true)
 	valueContentStyle := lipgloss.NewStyle().Foreground(colors.White())
 
 	labelRendered := valueLabelStyle.Render(valueLabel)
@@ -426,7 +426,12 @@ func (m RootModel) renderSettingsDetailBlock(settingsMeta []config.SettingMeta, 
 		MaxWidth(innerWidth).
 		Render(wrappedDesc)
 
+	titleStyle := lipgloss.NewStyle().Foreground(colors.Magenta()).Bold(true)
+	titleDisplay := titleStyle.Width(innerWidth).MaxWidth(innerWidth).Render(meta.Label)
+
 	detail := lipgloss.JoinVertical(lipgloss.Left,
+		titleDisplay,
+		"",
 		valueDisplay,
 		"",
 		divider,
@@ -724,8 +729,10 @@ func (m *RootModel) persistSettings() error {
 	if err := config.SaveSettings(m.Settings); err != nil {
 		return err
 	}
-	if reloader, ok := m.Service.(interface{ ReloadSettings() error }); ok {
-		if err := reloader.ReloadSettings(); err != nil {
+	if reloader, ok := m.Service.(interface {
+		ReloadSettings(settings *config.Settings) error
+	}); ok {
+		if err := reloader.ReloadSettings(m.Settings); err != nil {
 			return err
 		}
 	}
